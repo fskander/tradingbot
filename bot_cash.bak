@@ -1,0 +1,239 @@
+# --- TIMESTAMP LOGGER (Auto-Injected) ---
+import builtins
+from datetime import datetime
+try:
+    if not hasattr(builtins, 'original_print'):
+        builtins.original_print = print
+        def log(*args, **kwargs):
+            timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+            builtins.original_print(f"{timestamp}", *args, **kwargs)
+        print = log
+except: pass
+# ----------------------------------------
+
+import re, asyncio, time, os, gc, threading, sys, random
+import uvloop
+from telethon import TelegramClient, events, functions
+from pybit.unified_trading import HTTP
+
+# 0. IMPORT CONFIG (Unified)
+try:
+    import config
+    print("✅ Configuration loaded from config.py")
+except ImportError:
+    print("❌ CRITICAL: config.py not found.")
+    sys.exit(1)
+
+# 1. SPEED ENGINE
+asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+
+# ============================================================================
+# CONFIGURATION (MAPPED FROM UNIFIED CONFIG)
+# ============================================================================
+API_ID = getattr(config, 'TELEGRAM_API_ID', None)
+API_HASH = getattr(config, 'TELEGRAM_API_HASH', None)
+CHANNEL_ID = getattr(config, 'CASH_CHANNEL_ID', -1002228926060)
+
+BYBIT_KEY = getattr(config, 'CASH_API_KEY', None)
+BYBIT_SECRET = getattr(config, 'CASH_API_SECRET', None)
+
+if not all([API_ID, API_HASH, BYBIT_KEY, BYBIT_SECRET]):
+    print("❌ CRITICAL: Missing CASH keys in config.py")
+    sys.exit(1)
+
+RISK_AMOUNT = float(getattr(config, 'CASH_RISK_AMOUNT', 1000.0))
+PARTIAL_PCT = float(getattr(config, 'CASH_PARTIAL_PCT', 0.30))
+MAX_POSITION_USDT = float(getattr(config, 'CASH_MAX_POS', 50000.0))
+TESTNET = str(getattr(config, 'CASH_TESTNET', 'False')).lower() == 'true'
+
+sess = HTTP(testnet=TESTNET, api_key=BYBIT_KEY, api_secret=BYBIT_SECRET)
+client = TelegramClient('session_cash', API_ID, API_HASH)
+
+# ============================================================================
+# SHARED MEMORY
+# ============================================================================
+INSTRUMENT_CACHE = {} 
+PRICE_CACHE = {}
+PRICE_LOCK = threading.Lock()
+LAST_TRADE_TIME = {}
+TRADE_LOCK = threading.Lock()
+
+# ============================================================================
+# PARSING LOGIC
+# ============================================================================
+def parse_cash_signal(text):
+    try:
+        if "#BTC" not in text.upper(): return None
+        upper = text.upper()
+        if "BUY" in upper or "LONG" in upper: side = "Buy"
+        elif "SELL" in upper or "SHORT" in upper: side = "Sell"
+        else: return None
+
+        entry_m = re.search(r'Entry(?:.*?):?\s*([\d\.,]+)', text, re.IGNORECASE)
+        sl_m = re.search(r'(?:SL|Stop|Loss).*?:?\s*([\d\.,]+)', text, re.IGNORECASE)
+        
+        if not entry_m: return None
+        entry_price = float(entry_m.group(1).replace(',', ''))
+        sl_price = float(sl_m.group(1).replace(',', '')) if sl_m else None
+
+        targets = []
+        raw_targets = re.findall(r'(?:Target|TP)\s*?(\d+).*?[:\s]\s*?([\d\.,]+)', text, re.IGNORECASE)
+        for i, price_str in raw_targets:
+            try: targets.append(float(price_str.replace(',', '')))
+            except: pass
+        
+        if side == "Buy": targets.sort()
+        else: targets.sort(reverse=True)
+
+        return {"sym": "BTCUSDT", "side": side, "lp": entry_price, "sl": sl_price, "targets": targets, "cmp": "CMP" in upper}
+    except: return None
+
+# ============================================================================
+# EXECUTION ENGINE
+# ============================================================================
+def decimals(n):
+    s = "{:.10f}".format(n).rstrip('0')
+    return len(s.split('.')[1]) if '.' in s else 0
+
+def update_instrument(d):
+    s = d['symbol']
+    INSTRUMENT_CACHE[s] = {
+        'q': float(d['lotSizeFilter']['qtyStep']),
+        't': float(d['priceFilter']['tickSize']),
+        'q_dec': decimals(float(d['lotSizeFilter']['qtyStep'])),
+        't_dec': decimals(float(d['priceFilter']['tickSize']))
+    }
+
+def get_instrument(sym):
+    if sym in INSTRUMENT_CACHE: return INSTRUMENT_CACHE[sym]
+    try:
+        r = sess.get_instruments_info(category="linear", symbol=sym)
+        if r['result']['list']: 
+            update_instrument(r['result']['list'][0])
+            return INSTRUMENT_CACHE[sym]
+    except: return None
+    return None
+
+def rnd(p, d_obj): return "{:.{prec}f}".format(p, prec=d_obj['t_dec'])
+def qty_str(q, d_obj): return "{:.{prec}f}".format(q, prec=d_obj['q_dec'])
+
+def execute_trade(sig):
+    start_time = time.perf_counter(); gc.disable()
+    sym = sig['sym']; side = sig['side']
+    
+    with TRADE_LOCK:
+        now = time.time()
+        if sym in LAST_TRADE_TIME and (now - LAST_TRADE_TIME[sym] < 10): gc.enable(); return
+        LAST_TRADE_TIME[sym] = now
+
+    d = get_instrument(sym)
+    if not d: gc.enable(); return
+
+    market_price = 0
+    with PRICE_LOCK: market_price = PRICE_CACHE.get(sym, 0)
+    if market_price == 0:
+        try:
+            t = sess.get_tickers(category="linear", symbol=sym)
+            market_price = float(t['result']['list'][0]['ask1Price']) 
+        except: gc.enable(); return
+
+    if not sig['sl']: print("⚠️ No SL found."); gc.enable(); return
+    risk_dist = abs(market_price - sig['sl'])
+    if risk_dist == 0: gc.enable(); return
+
+    qty_raw = RISK_AMOUNT / risk_dist
+    total_q = (qty_raw // d['q']) * d['q']
+    
+    if (total_q * market_price) > MAX_POSITION_USDT:
+        total_q = (MAX_POSITION_USDT / market_price // d['q']) * d['q']
+        print(f"📉 Capped Position to: {total_q} BTC")
+
+    if total_q == 0: gc.enable(); return
+
+    qty_final = qty_str(total_q, d)
+    sl_str = rnd(sig['sl'], d)
+    final_tp = rnd(sig['targets'][-1], d) if sig['targets'] else ""
+    partial_orders = []
+
+    if sig['targets']:
+        partials = sig['targets'][:-1][:2]
+        for p_price in partials:
+            p_qty = (total_q * PARTIAL_PCT // d['q']) * d['q']
+            if p_qty > 0: partial_orders.append({"price": rnd(p_price, d), "qty": qty_str(p_qty, d)})
+
+    main_order = {"symbol": sym, "side": side, "qty": qty_final, "timeInForce": "GTC", "stopLoss": sl_str, "takeProfit": final_tp}
+    is_market = sig['cmp'] or (sig['lp'] and abs(market_price - sig['lp']) / market_price < 0.002)
+    if is_market: main_order["orderType"] = "Market"
+    else: main_order["orderType"] = "Limit"; main_order["price"] = rnd(sig['lp'], d)
+
+    try:
+        print(f"🦅 BotCash Signal: {side} BTC | Risk: ${RISK_AMOUNT} | Qty: {qty_final}")
+        resp = sess.place_order(category="linear", **main_order)
+        if resp['retCode'] == 0:
+            print(f"✅ Entry Sent! ID: {resp['retMsg']}")
+            if partial_orders:
+                time.sleep(0.5)
+                exit_side = "Sell" if side == "Buy" else "Buy"
+                for p in partial_orders:
+                    sess.place_order(category="linear", symbol=sym, side=exit_side, orderType="Limit", qty=p['qty'], price=p['price'], reduceOnly=True, timeInForce="GTC")
+                    print(f"🎯 Set Partial TP: {p['qty']} @ {p['price']}")
+    except Exception as e: print(f"❌ Execution Error: {e}")
+    gc.enable()
+
+def price_streamer():
+    print("🚀 BotCash Price Streamer Active...")
+    while True:
+        try:
+            r = sess.get_tickers(category="linear", symbol="BTCUSDT")
+            if 'result' in r:
+                with PRICE_LOCK: PRICE_CACHE["BTCUSDT"] = float(r['result']['list'][0]['lastPrice'])
+            time.sleep(3)
+        except: 
+            time.sleep(5)    # <--- ✅ NEW: SAFE 5 SECOND RETRY
+
+@client.on(events.NewMessage(chats=CHANNEL_ID))
+async def handler(event):
+    if not event.text: return
+    sig = parse_cash_signal(event.raw_text)
+    if sig: asyncio.get_running_loop().run_in_executor(None, execute_trade, sig)
+
+# ============================================================================
+# NEW HEARTBEAT (KEEPS CONNECTION ALIVE)
+# ============================================================================
+async def heartbeat_loop():
+    print(f"💓 HEARTBEAT STARTED (DC{client.session.dc_id})")
+    while True:
+        try:
+            # 1. Ping Telegram to keep socket open
+            await client(functions.PingRequest(ping_id=random.randint(0, 1000000)))
+            
+            # 2. Print a log every hour (3600s) to prove it's alive in logs
+            if time.time() % 28800 < 60:
+                print(f"💓 ALIVE: Connected to DC{client.session.dc_id} | {datetime.now().strftime('%H:%M')}")
+                
+        except Exception as e:
+            print(f"💀 CONNECTION LOST: {e}")
+        
+        # Wait 60 seconds before next ping
+        await asyncio.sleep(60)
+
+async def main():
+    print(f"\n💰 BOTCASH INITIALIZED (BTC | Risk ${RISK_AMOUNT} | Heartbeat Enabled)")
+    try:
+        r = sess.get_instruments_info(category="linear", symbol="BTCUSDT")
+        update_instrument(r['result']['list'][0])
+    except: pass
+    
+    threading.Thread(target=price_streamer, daemon=True).start()
+    
+    await client.start()
+    print(f"🌍 Connected to Telegram DC{client.session.dc_id}")
+    print("✅ BotCash Listening...")
+    
+    # START HEARTBEAT
+    asyncio.create_task(heartbeat_loop())
+    
+    await client.run_until_disconnected()
+
+if __name__ == '__main__':
+    asyncio.run(main())

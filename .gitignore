@@ -1,0 +1,17 @@
+
+*.session
+*.log
+__pycache__/
+nohup.out
+backup_v1/
+.bash_history
+.bashrc
+.gitconfig
+.profile
+.ssh/
+*.session
+*.session-journal
+.env
+service_account.json
+.git-credentials
+.git-credentials
