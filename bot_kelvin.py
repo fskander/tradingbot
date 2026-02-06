@@ -18,7 +18,10 @@ def parse_kelvin_signal(text):
         if "LONG" in upper or "BUY" in upper: side = "Buy"
         elif "SHORT" in upper or "SELL" in upper: side = "Sell"
         
-        entry, tp, sl = None, None, None
+        entry = None
+        sl = None
+        possible_tps = []
+        
         number_pattern = r'(?<!\d)(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)(?!\d)'
         
         for line in text.split('\n'):
@@ -28,12 +31,21 @@ def parse_kelvin_signal(text):
             if not nums: continue
             
             if "ENTRY" in u_line and not entry: entry = nums[0]
-            elif "TARGET" in u_line and not tp: tp = nums[-1]
             elif "STOP" in u_line and not sl: sl = nums[0]
+            elif "TARGET" in u_line or "TP" in u_line: 
+                possible_tps.extend(nums)
 
-        if not side and entry and tp: side = "Buy" if tp > entry else "Sell"
-        if symbol and side and entry and tp and sl:
-            return {"sym": symbol, "side": side, "entry": entry, "tp": tp, "sl": sl}
+        if not side and entry and sl: side = "Buy" if entry > sl else "Sell"
+
+        # SMART TP SELECTION
+        final_tp = 0
+        if possible_tps and side == "Buy":
+            final_tp = max(possible_tps) # Highest number for Long
+        elif possible_tps and side == "Sell":
+            final_tp = min(possible_tps) # Lowest number for Short
+
+        if symbol and side and entry and sl:
+            return {"sym": symbol, "side": side, "entry": entry, "tp": final_tp, "sl": sl}
         return None
     except: return None
 
@@ -49,9 +61,9 @@ cfg = {
     'RISK_AMOUNT': config.KELVIN_RISK_AMOUNT,
     'MAX_POS': config.KELVIN_MAX_POS,
     'LADDER': config.KELVIN_ENTRY_LADDER,
-    'PARTIAL_TP': 0.0,    # Disable Split TP
-    'TP_TARGET': 0.0,     # Irrelevant
-    'USE_TRAILING': False # Disable Trailing Stop
+    'PARTIAL_TP': 0.0,
+    'TP_TARGET': 0.0,   
+    'USE_TRAILING': False
 }
 
 if __name__ == "__main__":

@@ -55,7 +55,6 @@ class TradingBot:
         self.cfg = config_dict
         self.custom_parser = custom_parser
         
-        # Config
         self.api_id = self.cfg['TELEGRAM_API_ID']
         self.api_hash = self.cfg['TELEGRAM_API_HASH']
         self.channel_id = self.cfg['CHANNEL_ID']
@@ -113,8 +112,7 @@ class TradingBot:
     def qty_str(self, q, d_obj): return "{:.{prec}f}".format(q, prec=d_obj['q_dec'])
 
     def default_parser(self, text):
-        # ... (Same as before) ...
-        return None # Simplified for brevity in this paste, but logic remains if needed
+        return None # Implementation in bot.py logic if needed, usually passed in.
 
     async def execute_trade(self, sig):
         sym = sig['sym']
@@ -135,7 +133,6 @@ class TradingBot:
             except: pass
         if market_price == 0: self.log(f"❌ No price for {sym}"); return
 
-        # Risk Calc
         risk_dollars = self.risk_fixed
         if self.risk_mode == "PERCENTAGE":
             with self.data_lock:
@@ -151,62 +148,82 @@ class TradingBot:
 
         self.log(f"🚀 {sig['side']} {sym} | Risk: ${risk_dollars:.2f}")
 
-        # 1. Place Entries (Ladder)
-        total_weight = sum(step['weight'] for step in self.ladder)
         final_filled_qty = 0
-        
-        for i, step in enumerate(self.ladder):
-            step_qty_raw = (raw_total_qty * step['weight']) / total_weight
-            step_qty_final = (step_qty_raw // d['q']) * d['q']
-            if step_qty_final <= 0: continue
-            final_filled_qty += step_qty_final
 
-            price_offset = risk_dist * step['pos']
-            step_price = sig['entry'] - price_offset if sig['side'] == "Buy" else sig['entry'] + price_offset
+        # --- 1. ENTRY LOGIC ---
+        # CASE A: Range Entry (Defined by list of prices in signal)
+        if 'entries' in sig and len(sig['entries']) > 0:
+            self.log(f"   ⚖️ Range Entry Detected: {sig['entries']}")
+            num_entries = len(sig['entries'])
+            
+            # Equal weight for each price in the range (e.g., 50/50)
+            qty_per_entry = (raw_total_qty / num_entries // d['q']) * d['q']
+            
+            for i, price in enumerate(sig['entries']):
+                if qty_per_entry <= 0: continue
+                final_filled_qty += qty_per_entry
+                
+                order_args = {
+                    "category": "linear", "symbol": sym, "side": sig['side'], 
+                    "orderType": "Limit", "qty": self.qty_str(qty_per_entry, d), 
+                    "price": self.rnd(price, d), "timeInForce": "GTC",
+                    "stopLoss": self.rnd(sig['sl'], d)
+                }
+                
+                # Check Market
+                if abs(market_price - price) / market_price < 0.003 and i == 0:
+                    order_args["orderType"] = "Market"
+                    del order_args["price"]
 
-            order_args = {
-                "category": "linear", "symbol": sym, "side": sig['side'], 
-                "orderType": "Limit", "qty": self.qty_str(step_qty_final, d), 
-                "price": self.rnd(step_price, d), "timeInForce": "GTC",
-                "stopLoss": self.rnd(sig['sl'], d)
-            }
+                resp = await self.async_exec.place_order(**order_args)
+                if resp.get('retCode') == 0:
+                    self.log(f"   👉 Range Order {i+1}: {order_args['orderType']} @ {self.rnd(price, d)} | Qty: {self.qty_str(qty_per_entry, d)}")
+                else:
+                    self.log(f"   ❌ Range Order {i+1} Failed: {resp.get('retMsg')}")
+                await asyncio.sleep(0.05)
+                
+        # CASE B: Standard Ladder (Main Bot)
+        else:
+            total_weight = sum(step['weight'] for step in self.ladder)
+            for i, step in enumerate(self.ladder):
+                step_qty_raw = (raw_total_qty * step['weight']) / total_weight
+                step_qty_final = (step_qty_raw // d['q']) * d['q']
+                if step_qty_final <= 0: continue
+                final_filled_qty += step_qty_final
 
-            is_market = False
-            if abs(market_price - step_price) / market_price < 0.003 and step['pos'] == 0:
-                order_args["orderType"] = "Market"
-                del order_args["price"]
-                is_market = True
+                price_offset = risk_dist * step['pos']
+                step_price = sig['entry'] - price_offset if sig['side'] == "Buy" else sig['entry'] + price_offset
 
-            resp = await self.async_exec.place_order(**order_args)
-            if resp.get('retCode') == 0:
-                type_str = "MARKET" if is_market else f"LIMIT @ {self.rnd(step_price, d)}"
-                self.log(f"   ⚡ Step {i+1}: {type_str} | Qty: {self.qty_str(step_qty_final, d)}")
-            else:
-                self.log(f"   ❌ Step {i+1} Failed: {resp.get('retMsg')}")
-            await asyncio.sleep(0.05)
+                order_args = {
+                    "category": "linear", "symbol": sym, "side": sig['side'], 
+                    "orderType": "Limit", "qty": self.qty_str(step_qty_final, d), 
+                    "price": self.rnd(step_price, d), "timeInForce": "GTC",
+                    "stopLoss": self.rnd(sig['sl'], d)
+                }
 
-        # 2. EXIT LOGIC SWITCH
+                if abs(market_price - step_price) / market_price < 0.003 and step['pos'] == 0:
+                    order_args["orderType"] = "Market"
+                    del order_args["price"]
+
+                resp = await self.async_exec.place_order(**order_args)
+                if resp.get('retCode') == 0:
+                    self.log(f"   👉 Ladder Step {i+1}: {order_args['orderType']} | Qty: {self.qty_str(step_qty_final, d)}")
+                else:
+                    self.log(f"   ❌ Step {i+1} Failed: {resp.get('retMsg')}")
+                await asyncio.sleep(0.05)
+
+        # --- 2. EXIT LOGIC ---
         tp_side = "Sell" if sig['side'] == "Buy" else "Buy"
 
-        # A: Explicit Multi-Target (From Cash Parser)
+        # A: Explicit Multi-Target (Cash Bot)
         if 'tps' in sig and len(sig['tps']) > 0:
-            self.log(f"   🎯 Multi-Target Mode: Found {len(sig['tps'])} targets")
-            
-            # Sort TPs. Buy=Low->High, Sell=High->Low
             tps = sorted(sig['tps'], reverse=(sig['side']=="Sell"))
-            
-            # Use self.partial_tp (e.g., 0.30) for each step except the last
             qty_per_step = (final_filled_qty * self.partial_tp // d['q']) * d['q']
             qty_placed = 0
             
             for i, price in enumerate(tps):
                 is_last = (i == len(tps) - 1)
-                
-                # If last target, dump everything remaining
-                if is_last:
-                    q = final_filled_qty - qty_placed
-                else:
-                    q = qty_per_step
+                q = final_filled_qty - qty_placed if is_last else qty_per_step
                 
                 if q > 0:
                     try:
@@ -215,11 +232,11 @@ class TradingBot:
                             qty=self.qty_str(q, d), price=self.rnd(price, d),
                             reduceOnly=True, timeInForce="GTC"
                         )
-                        self.log(f"      📍 TP{i+1}: {self.rnd(price, d)} (Qty: {self.qty_str(q, d)})")
+                        self.log(f"   🎯 TP{i+1} Set: {self.rnd(price, d)} (Qty: {self.qty_str(q, d)})")
                         qty_placed += q
                     except Exception as e: self.log(f"⚠️ TP{i+1} Err: {e}")
 
-        # B: Pro Mode (Calculated 0.8R + Target)
+        # B: Pro Mode Split (Main Bot)
         elif self.partial_tp > 0 and self.tp_target > 0:
             tp1_qty = (final_filled_qty * self.partial_tp // d['q']) * d['q']
             tp2_qty = final_filled_qty - tp1_qty
@@ -229,16 +246,15 @@ class TradingBot:
                 await self.async_exec.place_order(category="linear", symbol=sym, side=tp_side, orderType="Limit", qty=self.qty_str(tp1_qty, d), price=self.rnd(tp1_price, d), reduceOnly=True)
             if tp2_qty > 0:
                 await self.async_exec.place_order(category="linear", symbol=sym, side=tp_side, orderType="Limit", qty=self.qty_str(tp2_qty, d), price=self.rnd(sig['tp'], d), reduceOnly=True)
-            self.log("   🎯 Pro Split TPs Placed (0.8R & Final)")
+            self.log("   🎯 Pro Split TPs Placed")
 
-        # C: Simple Mode (Single Target)
+        # C: Single Target (Kelvin/Simple)
         else:
             await self.async_exec.place_order(category="linear", symbol=sym, side=tp_side, orderType="Limit", qty=self.qty_str(final_filled_qty, d), price=self.rnd(sig['tp'], d), reduceOnly=True)
-            self.log(f"   🎯 Single TP Placed at {self.rnd(sig['tp'], d)}")
+            self.log(f"   🎯 Single TP Set: {self.rnd(sig['tp'], d)}")
 
         # 3. Trailing Stop
         if self.use_trailing:
-            # Trailing starts at 0.8R distance usually
             activation_dist = risk_dist * 0.8 
             activate_p = sig['entry'] + activation_dist if sig['side'] == "Buy" else sig['entry'] - activation_dist
             await self.async_exec.set_trading_stop(category="linear", symbol=sym, trailingStop=self.rnd(risk_dist, d), activePrice=self.rnd(activate_p, d))
@@ -269,7 +285,7 @@ class TradingBot:
             except: time.sleep(5)
 
     async def run(self):
-        self.log(f"🚀 ACTIVE (v6.2 Multi-TP)")
+        self.log(f"🚀 ACTIVE (v7.0 Logic)")
         await self.async_exec.init_session()
         threading.Thread(target=self.background_streamer, daemon=True).start()
         
