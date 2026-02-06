@@ -53,7 +53,7 @@ class TradingBot:
     def __init__(self, name, config_dict, custom_parser=None):
         self.name = name
         self.cfg = config_dict
-        self.custom_parser = custom_parser  # <--- INJECT CUSTOM PARSER HERE
+        self.custom_parser = custom_parser
         
         # Unpack Config
         self.api_id = self.cfg['TELEGRAM_API_ID']
@@ -62,13 +62,17 @@ class TradingBot:
         self.bybit_key = self.cfg['API_KEY']
         self.bybit_secret = self.cfg['API_SECRET']
         self.testnet = self.cfg['TESTNET']
+        
         self.risk_mode = self.cfg['RISK_MODE']
         self.risk_factor = float(self.cfg['RISK_FACTOR'])
         self.risk_fixed = float(self.cfg['RISK_AMOUNT'])
         self.max_pos = float(self.cfg['MAX_POS'])
         self.ladder = self.cfg['LADDER']
-        self.partial_tp = float(self.cfg.get('PARTIAL_TP', 0.5))
+        
+        # --- NEW FLAGS ---
+        self.partial_tp = float(self.cfg.get('PARTIAL_TP', 0.0)) # 0.0 means disabled
         self.tp_target = float(self.cfg.get('TP_TARGET', 0.8))
+        self.use_trailing = self.cfg.get('USE_TRAILING', False)
 
         self.sess = HTTP(testnet=self.testnet, api_key=self.bybit_key, api_secret=self.bybit_secret)
         self.async_exec = AsyncBybit(self.bybit_key, self.bybit_secret, self.testnet)
@@ -109,7 +113,6 @@ class TradingBot:
     def rnd(self, p, d_obj): return "{:.{prec}f}".format(p, prec=d_obj['t_dec'])
     def qty_str(self, q, d_obj): return "{:.{prec}f}".format(q, prec=d_obj['q_dec'])
 
-    # Default Parser (Main Bot Style)
     def default_parser(self, text):
         try:
             upper = text.upper()
@@ -161,13 +164,12 @@ class TradingBot:
             except: pass
         if market_price == 0: self.log(f"❌ No price for {sym}"); return
 
-        # Risk
         risk_dollars = self.risk_fixed
         if self.risk_mode == "PERCENTAGE":
             with self.data_lock:
                 if self.wallet_balance > 0:
                     risk_dollars = self.wallet_balance * self.risk_factor
-                    self.log(f"📊 Dynamic Risk: ${risk_dollars:.2f} ({self.risk_factor*100}%)")
+                    self.log(f"📊 Dynamic Risk: ${risk_dollars:.2f}")
                 else: self.log(f"⚠️ Balance 0/Unknown. Using Fixed: ${risk_dollars}")
 
         risk_dist = abs(sig['entry'] - sig['sl'])
@@ -180,7 +182,7 @@ class TradingBot:
 
         final_filled_qty = 0
         
-        # 1. Entries
+        # 1. Place Entries
         for i, step in enumerate(self.ladder):
             step_qty_raw = (raw_total_qty * step['weight']) / total_weight
             step_qty_final = (step_qty_raw // d['q']) * d['q']
@@ -211,21 +213,33 @@ class TradingBot:
                 self.log(f"   ❌ Step {i+1} Failed: {resp.get('retMsg')}")
             await asyncio.sleep(0.05)
 
-        # 2. Exits (Split TP)
-        tp1_qty = (final_filled_qty * self.partial_tp // d['q']) * d['q']
-        tp2_qty = final_filled_qty - tp1_qty
+        # 2. Logic: Split TP vs Standard TP
         tp_side = "Sell" if sig['side'] == "Buy" else "Buy"
-        tp1_price = sig['entry'] + (risk_dist * self.tp_target) if sig['side'] == "Buy" else sig['entry'] - (risk_dist * self.tp_target)
-
-        if tp1_qty > 0:
-            await self.async_exec.place_order(category="linear", symbol=sym, side=tp_side, orderType="Limit", qty=self.qty_str(tp1_qty, d), price=self.rnd(tp1_price, d), reduceOnly=True)
-        if tp2_qty > 0:
-            await self.async_exec.place_order(category="linear", symbol=sym, side=tp_side, orderType="Limit", qty=self.qty_str(tp2_qty, d), price=self.rnd(sig['tp'], d), reduceOnly=True)
         
-        self.log("   🎯 TPs Placed")
+        if self.partial_tp > 0:
+            # --- PRO MODE: SPLIT TP ---
+            tp1_qty = (final_filled_qty * self.partial_tp // d['q']) * d['q']
+            tp2_qty = final_filled_qty - tp1_qty
+            tp1_price = sig['entry'] + (risk_dist * self.tp_target) if sig['side'] == "Buy" else sig['entry'] - (risk_dist * self.tp_target)
+            
+            if tp1_qty > 0:
+                await self.async_exec.place_order(category="linear", symbol=sym, side=tp_side, orderType="Limit", qty=self.qty_str(tp1_qty, d), price=self.rnd(tp1_price, d), reduceOnly=True)
+            if tp2_qty > 0:
+                await self.async_exec.place_order(category="linear", symbol=sym, side=tp_side, orderType="Limit", qty=self.qty_str(tp2_qty, d), price=self.rnd(sig['tp'], d), reduceOnly=True)
+            self.log("   🎯 Split TPs Placed (Pro Mode)")
+        else:
+            # --- SIMPLE MODE: SINGLE TP ---
+            # We don't place a Limit TP here because Telegram usually implies TP is flexible
+            # BUT for safety, we place a ReduceOnly Limit at the final TP found in the signal
+            await self.async_exec.place_order(category="linear", symbol=sym, side=tp_side, orderType="Limit", qty=self.qty_str(final_filled_qty, d), price=self.rnd(sig['tp'], d), reduceOnly=True)
+            self.log(f"   🎯 Single TP Placed at {self.rnd(sig['tp'], d)}")
 
-        # 3. Trailing Stop
-        await self.async_exec.set_trading_stop(category="linear", symbol=sym, trailingStop=self.rnd(risk_dist, d), activePrice=self.rnd(tp1_price, d))
+        # 3. Logic: Trailing Stop
+        if self.use_trailing:
+            # Calculate activation price for trailing
+            activate_p = sig['entry'] + (risk_dist * self.tp_target) if sig['side'] == "Buy" else sig['entry'] - (risk_dist * self.tp_target)
+            await self.async_exec.set_trading_stop(category="linear", symbol=sym, trailingStop=self.rnd(risk_dist, d), activePrice=self.rnd(activate_p, d))
+            self.log("   🛡️ Trailing Stop Activated")
 
         try:
             with open("trades_log.csv", "a") as f: f.write(f"{time.time()},{sym},{self.name}\n")
@@ -240,7 +254,6 @@ class TradingBot:
                 if 'result' in r:
                     with self.data_lock:
                         for i in r['result']['list']: self.price_cache[i['symbol']] = float(i['lastPrice'])
-                
                 if time.time() - last_balance > 10:
                     try:
                         b = self.sess.get_wallet_balance(accountType="UNIFIED", coin="USDT")
@@ -253,7 +266,7 @@ class TradingBot:
             except: time.sleep(5)
 
     async def run(self):
-        self.log(f"🚀 ACTIVE (v6.0 Engine) | Risk: {self.risk_mode}")
+        self.log(f"🚀 ACTIVE (v6.1) | SplitTP: {self.partial_tp > 0} | Trail: {self.use_trailing}")
         await self.async_exec.init_session()
         threading.Thread(target=self.background_streamer, daemon=True).start()
         
@@ -261,13 +274,9 @@ class TradingBot:
         async def handler(event):
             if not event.text: return
             text = event.raw_text.replace('**', '').replace('__', '')
+            if self.custom_parser: sig = self.custom_parser(text)
+            else: sig = self.default_parser(text)
             
-            # --- USE CUSTOM PARSER IF PROVIDED ---
-            if self.custom_parser:
-                sig = self.custom_parser(text)
-            else:
-                sig = self.default_parser(text)
-                
             if sig:
                 self.log(f"✅ PARSED: {sig['sym']} {sig['side']}")
                 await self.execute_trade(sig)

@@ -13,8 +13,9 @@ cfg = {
     'RISK_AMOUNT': config.MAIN_RISK_PER_TRADE,
     'MAX_POS': config.MAIN_MAX_POS,
     'LADDER': config.MAIN_ENTRY_LADDER,
-    'PARTIAL_TP': config.MAIN_PARTIAL_TP,
-    'TP_TARGET': config.MAIN_TP_TARGET
+    'PARTIAL_TP': 0.5,    # Enable Split TP
+    'TP_TARGET': 0.8,     # 0.8R Target for first TP
+    'USE_TRAILING': True  # Enable Trailing Stop
 }
 
 if __name__ == "__main__":

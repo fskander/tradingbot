@@ -2,20 +2,14 @@ import config
 import re
 from trading_engine import start_bot
 
-# --- SPECIFIC PARSER FOR CASH CHANNEL ---
 def parse_cash_signal(text):
     try:
         upper = text.upper()
         symbol = None
-        
-        # 1. Look for $COIN
         hash_match = re.search(r'\$([A-Z0-9]+)', upper)
-        if hash_match: 
-            symbol = hash_match.group(1) + "USDT"
-        
+        if hash_match: symbol = hash_match.group(1) + "USDT"
         if not symbol: return None
 
-        # 2. Determine Side
         side = None
         if "LONG" in upper: side = "Buy"
         elif "SHORT" in upper: side = "Sell"
@@ -23,28 +17,18 @@ def parse_cash_signal(text):
         entry, tp, sl = None, None, None
         number_pattern = r'(?<!\d)(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)(?!\d)'
         
-        lines = text.split('\n')
-        for line in lines:
+        for line in text.split('\n'):
             u_line = line.upper()
-            if "PERCENTAGE" in u_line or "%" in u_line: continue
-            
+            if "PERCENTAGE" in u_line: continue
             matches = re.findall(number_pattern, line)
             nums = [float(m.replace(',', '')) for m in matches if float(m.replace(',', '')) > 0]
-            
             if not nums: continue
             
-            # Cash channel often gives ranges "Entry: 1.1 - 1.2". We take the first one.
-            if any(k in u_line for k in ["ENTRY", "ENT", "EP "]) and not entry: 
-                entry = nums[0] 
-            elif any(k in u_line for k in ["TARGET", "TP", "TAKE PROFIT"]) and not tp: 
-                tp = nums[-1] # Take the last TP (highest for long)
-            elif any(k in u_line for k in ["STOPLOSS", "STOP LOSS", "SL", "STOP"]) and not sl: 
-                sl = nums[0]
+            if any(k in u_line for k in ["ENTRY", "ENT", "EP "]) and not entry: entry = nums[0]
+            elif any(k in u_line for k in ["TARGET", "TP", "TAKE PROFIT"]) and not tp: tp = nums[-1]
+            elif any(k in u_line for k in ["STOPLOSS", "STOP LOSS", "SL", "STOP"]) and not sl: sl = nums[0]
 
-        # Logic for auto-side detection if missing
-        if not side and entry and tp: 
-            side = "Buy" if tp > entry else "Sell"
-
+        if not side and entry and tp: side = "Buy" if tp > entry else "Sell"
         if symbol and side and entry and tp and sl:
             return {"sym": symbol, "side": side, "entry": entry, "tp": tp, "sl": sl}
         return None
@@ -62,10 +46,10 @@ cfg = {
     'RISK_AMOUNT': config.CASH_RISK_AMOUNT,
     'MAX_POS': config.CASH_MAX_POS,
     'LADDER': config.CASH_ENTRY_LADDER,
-    'PARTIAL_TP': config.CASH_PARTIAL_PCT,
-    'TP_TARGET': 0.8
+    'PARTIAL_TP': 0.0,    # Disable Split TP
+    'TP_TARGET': 0.0,     # Irrelevant
+    'USE_TRAILING': False # Disable Trailing Stop
 }
 
 if __name__ == "__main__":
-    # We pass the custom parser here
     start_bot("CASH", cfg, parser=parse_cash_signal)

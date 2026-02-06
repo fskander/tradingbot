@@ -2,22 +2,16 @@ import config
 import re
 from trading_engine import start_bot
 
-# --- SPECIFIC PARSER FOR KELVIN CHANNEL ---
 def parse_kelvin_signal(text):
     try:
         upper = text.upper()
         symbol = None
-        
-        # Kelvin often uses "Pair: BTC/USDT"
         if "PAIR:" in upper:
             match = re.search(r'PAIR:.*?([A-Z0-9]+)', upper)
             if match: symbol = match.group(1) + "USDT"
-        
         if not symbol:
-            # Fallback to looking for /USDT
             match = re.search(r'([A-Z0-9]+)/USDT', upper)
             if match: symbol = match.group(1) + "USDT"
-
         if not symbol: return None
 
         side = None
@@ -34,11 +28,10 @@ def parse_kelvin_signal(text):
             if not nums: continue
             
             if "ENTRY" in u_line and not entry: entry = nums[0]
-            elif "TARGET" in u_line and not tp: tp = nums[-1] # Aim high
+            elif "TARGET" in u_line and not tp: tp = nums[-1]
             elif "STOP" in u_line and not sl: sl = nums[0]
 
         if not side and entry and tp: side = "Buy" if tp > entry else "Sell"
-
         if symbol and side and entry and tp and sl:
             return {"sym": symbol, "side": side, "entry": entry, "tp": tp, "sl": sl}
         return None
@@ -56,8 +49,9 @@ cfg = {
     'RISK_AMOUNT': config.KELVIN_RISK_AMOUNT,
     'MAX_POS': config.KELVIN_MAX_POS,
     'LADDER': config.KELVIN_ENTRY_LADDER,
-    'PARTIAL_TP': 0.5,
-    'TP_TARGET': 0.8
+    'PARTIAL_TP': 0.0,    # Disable Split TP
+    'TP_TARGET': 0.0,     # Irrelevant
+    'USE_TRAILING': False # Disable Trailing Stop
 }
 
 if __name__ == "__main__":
