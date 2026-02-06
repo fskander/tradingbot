@@ -37,8 +37,13 @@ class AsyncBybit:
         url = f"{self.base_url}/v5/order/create"
         headers = self._sign(kwargs)
         try:
+            # --- START TIMER ---
+            t0 = time.time()
             async with self.session.post(url, headers=headers, json=kwargs, timeout=2) as resp:
-                return await resp.json()
+                data = await resp.json()
+                # --- END TIMER ---
+                print(f"      ⏱️ API Latency: {(time.time()-t0)*1000:.2f}ms")
+                return data
         except Exception as e: return {"retCode": -1, "retMsg": str(e)}
 
     async def set_trading_stop(self, **kwargs):
@@ -112,7 +117,7 @@ class TradingBot:
     def qty_str(self, q, d_obj): return "{:.{prec}f}".format(q, prec=d_obj['q_dec'])
 
     def default_parser(self, text):
-        return None # Implementation in bot.py logic if needed, usually passed in.
+        return None 
 
     async def execute_trade(self, sig):
         sym = sig['sym']
@@ -151,12 +156,9 @@ class TradingBot:
         final_filled_qty = 0
 
         # --- 1. ENTRY LOGIC ---
-        # CASE A: Range Entry (Defined by list of prices in signal)
         if 'entries' in sig and len(sig['entries']) > 0:
             self.log(f"   ⚖️ Range Entry Detected: {sig['entries']}")
             num_entries = len(sig['entries'])
-            
-            # Equal weight for each price in the range (e.g., 50/50)
             qty_per_entry = (raw_total_qty / num_entries // d['q']) * d['q']
             
             for i, price in enumerate(sig['entries']):
@@ -170,7 +172,6 @@ class TradingBot:
                     "stopLoss": self.rnd(sig['sl'], d)
                 }
                 
-                # Check Market
                 if abs(market_price - price) / market_price < 0.003 and i == 0:
                     order_args["orderType"] = "Market"
                     del order_args["price"]
@@ -181,8 +182,6 @@ class TradingBot:
                 else:
                     self.log(f"   ❌ Range Order {i+1} Failed: {resp.get('retMsg')}")
                 await asyncio.sleep(0.05)
-                
-        # CASE B: Standard Ladder (Main Bot)
         else:
             total_weight = sum(step['weight'] for step in self.ladder)
             for i, step in enumerate(self.ladder):
@@ -215,7 +214,6 @@ class TradingBot:
         # --- 2. EXIT LOGIC ---
         tp_side = "Sell" if sig['side'] == "Buy" else "Buy"
 
-        # A: Explicit Multi-Target (Cash Bot)
         if 'tps' in sig and len(sig['tps']) > 0:
             tps = sorted(sig['tps'], reverse=(sig['side']=="Sell"))
             qty_per_step = (final_filled_qty * self.partial_tp // d['q']) * d['q']
@@ -236,7 +234,6 @@ class TradingBot:
                         qty_placed += q
                     except Exception as e: self.log(f"⚠️ TP{i+1} Err: {e}")
 
-        # B: Pro Mode Split (Main Bot)
         elif self.partial_tp > 0 and self.tp_target > 0:
             tp1_qty = (final_filled_qty * self.partial_tp // d['q']) * d['q']
             tp2_qty = final_filled_qty - tp1_qty
@@ -248,12 +245,10 @@ class TradingBot:
                 await self.async_exec.place_order(category="linear", symbol=sym, side=tp_side, orderType="Limit", qty=self.qty_str(tp2_qty, d), price=self.rnd(sig['tp'], d), reduceOnly=True)
             self.log("   🎯 Pro Split TPs Placed")
 
-        # C: Single Target (Kelvin/Simple)
         else:
             await self.async_exec.place_order(category="linear", symbol=sym, side=tp_side, orderType="Limit", qty=self.qty_str(final_filled_qty, d), price=self.rnd(sig['tp'], d), reduceOnly=True)
             self.log(f"   🎯 Single TP Set: {self.rnd(sig['tp'], d)}")
 
-        # 3. Trailing Stop
         if self.use_trailing:
             activation_dist = risk_dist * 0.8 
             activate_p = sig['entry'] + activation_dist if sig['side'] == "Buy" else sig['entry'] - activation_dist
