@@ -6,20 +6,29 @@ def parse_kelvin_signal(text):
     try:
         upper = text.upper()
         symbol = None
+        
+        # 1. Try PAIR: X/Y
         if "PAIR:" in upper:
             match = re.search(r'PAIR:.*?([A-Z0-9]+)', upper)
             if match: symbol = match.group(1) + "USDT"
+            
+        # 2. Try X/USDT
         if not symbol:
             match = re.search(r'([A-Z0-9]+)/USDT', upper)
             if match: symbol = match.group(1) + "USDT"
+            
+        # 3. Try X USDT (Space separated)
+        if not symbol:
+            match = re.search(r'([A-Z0-9]+)\s+USDT', upper)
+            if match: symbol = match.group(1) + "USDT"
+
         if not symbol: return None
 
         side = None
         if "LONG" in upper or "BUY" in upper: side = "Buy"
         elif "SHORT" in upper or "SELL" in upper: side = "Sell"
         
-        entry = None
-        sl = None
+        entry, sl = None, None
         possible_tps = []
         
         number_pattern = r'(?<!\d)(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)(?!\d)'
@@ -37,12 +46,11 @@ def parse_kelvin_signal(text):
 
         if not side and entry and sl: side = "Buy" if entry > sl else "Sell"
 
-        # SMART TP SELECTION
         final_tp = 0
-        if possible_tps and side == "Buy":
-            final_tp = max(possible_tps) # Highest number for Long
-        elif possible_tps and side == "Sell":
-            final_tp = min(possible_tps) # Lowest number for Short
+        if possible_tps:
+            # Smart TP: If Short, take the Lowest. If Long, take Highest.
+            if side == "Buy": final_tp = max(possible_tps)
+            elif side == "Sell": final_tp = min(possible_tps)
 
         if symbol and side and entry and sl:
             return {"sym": symbol, "side": side, "entry": entry, "tp": final_tp, "sl": sl}
