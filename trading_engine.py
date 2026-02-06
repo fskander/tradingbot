@@ -115,36 +115,21 @@ class TradingBot:
     def qty_str(self, q, d_obj): return "{:.{prec}f}".format(q, prec=d_obj['q_dec'])
 
     def default_parser(self, text):
-        try:
-            upper = text.upper()
-            symbol = None
-            hash_match = re.search(r'[#$]([A-Z0-9]+)', upper)
-            if hash_match: symbol = hash_match.group(1) + "USDT"
-            else:
-                std_match = re.search(r'([A-Z0-9]+)\s*/\s*USDT', upper)
-                if std_match: symbol = std_match.group(1) + "USDT"
-            if not symbol: return None 
+        return None 
 
-            side = "Buy" if "LONG" in upper else "Sell" if "SHORT" in upper else None
-            entry, tp, sl = None, None, None
-            number_pattern = r'(?<!\d)(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)(?!\d)'
-            
-            for line in text.split('\n'):
-                u_line = line.upper()
-                if "PERCENTAGE" in u_line or "%" in u_line: continue
-                matches = re.findall(number_pattern, line)
-                nums = [float(m.replace(',', '')) for m in matches if float(m.replace(',', '')) > 0]
-                if not nums: continue
-                
-                if any(k in u_line for k in ["ENTRY", "ENT", "EP "]) and not entry: entry = nums[0]
-                elif any(k in u_line for k in ["TARGET", "TP", "TAKE PROFIT"]) and not tp: tp = nums[0]
-                elif any(k in u_line for k in ["STOPLOSS", "STOP LOSS", "SL", "STOP"]) and not sl: sl = nums[0]
-
-            if not side and entry and tp: side = "Buy" if tp > entry else "Sell"
-            if symbol and side and entry and tp and sl:
-                return {"sym": symbol, "side": side, "entry": entry, "tp": tp, "sl": sl}
-            return None
-        except: return None
+    def normalize_price(self, price, market_price):
+        if not price or price <= 0: return price
+        # If price is 157 and market is 0.15, convert to 0.157
+        # Safety: Don't normalize if market price is unknown (0)
+        if market_price == 0: return price
+        
+        # Shift decimal left if too high
+        while price > (market_price * 2): 
+            price /= 10.0
+        # Shift decimal right if too low
+        while price < (market_price / 10): 
+            price *= 10.0
+        return price
 
     async def execute_trade(self, sig):
         sym = sig['sym']
@@ -166,6 +151,23 @@ class TradingBot:
             except: pass
         if market_price == 0: self.log(f"❌ No price for {sym}"); return
 
+        # --- 1.5 DECIMAL NORMALIZATION (THE FIX) ---
+        if sig['sl']: sig['sl'] = self.normalize_price(sig['sl'], market_price)
+        if sig['tp']: sig['tp'] = self.normalize_price(sig['tp'], market_price)
+        
+        if sig['entry'] != -1:
+            sig['entry'] = self.normalize_price(sig['entry'], market_price)
+        else:
+            sig['entry'] = market_price
+            self.log(f"⚡ CMP Entry detected. Setting Entry = {market_price}")
+
+        if 'entries' in sig and sig['entries']:
+            sig['entries'] = [self.normalize_price(p, market_price) for p in sig['entries'] if p != -1]
+        
+        if 'tps' in sig and sig['tps']:
+            sig['tps'] = [self.normalize_price(p, market_price) for p in sig['tps']]
+        # -------------------------------------------
+
         # 2. RISK CALCULATION
         risk_dollars = self.risk_fixed
         if self.risk_mode == "PERCENTAGE":
@@ -175,51 +177,30 @@ class TradingBot:
                     self.log(f"📊 Dynamic Risk: ${risk_dollars:.2f}")
                 else: self.log(f"⚠️ Balance 0. Using Fixed: ${risk_dollars}")
 
-        # 3. INTERPOLATED LADDER LOGIC (RESTORED LEGACY)
-        # Definition: 
-        # pos 0.0 = Market Price
-        # pos 1.0 = Signal Entry Price
+        # 3. INTERPOLATED LADDER LOGIC
         signal_entry = sig['entry']
         sl_price = sig['sl']
-
-        # Determine Range: [CMP ... SignalEntry]
-        # For Buy: usually CMP < SignalEntry (Buying into a dip) or CMP > SignalEntry (Catching breakout?)
-        # Standardize: Start=CMP, End=SignalEntry
         
-        # Calculate Total Risk Factor first
         total_risk_factor = 0.0
-        
-        # Pre-calculate steps to find risk
         steps_to_execute = []
         
-        # Check if we have Explicit Entries (Cash Bot) or Ladder (Main Bot)
         if 'entries' in sig and len(sig['entries']) > 0:
-            # Handle explicit list of entries (split risk evenly)
+            # Explicit Range
             for i, price in enumerate(sig['entries']):
                  dist = abs(price - sl_price)
-                 # Assume weight 1.0 for each explicit entry
                  total_risk_factor += (dist * 1.0)
-                 steps_to_execute.append({'price': price, 'weight': 1.0, 'pos': 0}) # pos irrelevant here
+                 steps_to_execute.append({'price': price, 'weight': 1.0, 'pos': 0})
         else:
-            # Use Config Ladder
+            # Config Ladder
             for step in self.ladder:
-                # Interpolate Price
-                # Price = CMP + (SignalEntry - CMP) * pos
                 step_price = market_price + (signal_entry - market_price) * step['pos']
-                
-                # Validation: Don't place buy orders above market (taker) unless pos=0
-                # Actually, legacy code just executed it. 
-                # If pos=0, it's CMP. If pos=1, it's Entry.
-                
                 dist = abs(step_price - sl_price)
                 total_risk_factor += (dist * step['weight'])
                 steps_to_execute.append({'price': step_price, 'weight': step['weight'], 'pos': step['pos']})
 
         if total_risk_factor == 0: return
 
-        # Calculate Base Unit
         base_unit_qty = risk_dollars / total_risk_factor
-        
         self.log(f"🚀 {sig['side']} {sym} | Risk: ${risk_dollars:.2f} | Ladder: CMP->{signal_entry}")
 
         # 4. EXECUTE
@@ -239,7 +220,6 @@ class TradingBot:
                 "stopLoss": self.rnd(sl_price, d)
             }
 
-            # If Price is extremely close to CMP or pos was 0.0, use Market
             is_market = False
             pct_diff = abs(market_price - step['price']) / market_price
             if step.get('pos') == 0.0 or pct_diff < 0.002:
@@ -248,20 +228,17 @@ class TradingBot:
                 is_market = True
 
             resp = await self.async_exec.place_order(**order_args)
-            
             if resp.get('retCode') == 0:
                 type_str = "MARKET" if is_market else f"LIMIT @ {self.rnd(step['price'], d)}"
                 self.log(f"   👉 Step {i+1}: {type_str} | Qty: {self.qty_str(step_qty_final, d)}")
             else:
                 self.log(f"   ❌ Step {i+1} Failed: {resp.get('retMsg')}")
-            
             await asyncio.sleep(0.05)
 
         # 5. EXITS
         tp_side = "Sell" if sig['side'] == "Buy" else "Buy"
 
         if 'tps' in sig and len(sig['tps']) > 0:
-            # Multi-Target
             tps = sorted(sig['tps'], reverse=(sig['side']=="Sell"))
             qty_per_step = (final_filled_qty * self.partial_tp // d['q']) * d['q']
             qty_placed = 0
@@ -273,16 +250,12 @@ class TradingBot:
                     qty_placed += q
                     
         elif self.partial_tp > 0 and self.tp_target > 0:
-            # Pro Split (0.8R based)
-            # Legacy Note: R distance is now fuzzy because we have multiple entries.
-            # We will use (Anchor Entry - SL) as the "R" basis.
-            avg_entry = market_price # Approximation
+            avg_entry = market_price
             risk_dist = abs(avg_entry - sl_price)
+            tp1_price = avg_entry + (risk_dist * self.tp_target) if sig['side'] == "Buy" else avg_entry - (risk_dist * self.tp_target)
             
             tp1_qty = (final_filled_qty * self.partial_tp // d['q']) * d['q']
             tp2_qty = final_filled_qty - tp1_qty
-            
-            tp1_price = avg_entry + (risk_dist * self.tp_target) if sig['side'] == "Buy" else avg_entry - (risk_dist * self.tp_target)
             
             if tp1_qty > 0:
                 await self.async_exec.place_order(category="linear", symbol=sym, side=tp_side, orderType="Limit", qty=self.qty_str(tp1_qty, d), price=self.rnd(tp1_price, d), reduceOnly=True)
@@ -291,21 +264,13 @@ class TradingBot:
             self.log("   🎯 Pro Split TPs Placed")
             
         else:
-            # Simple Single TP
             await self.async_exec.place_order(category="linear", symbol=sym, side=tp_side, orderType="Limit", qty=self.qty_str(final_filled_qty, d), price=self.rnd(sig['tp'], d), reduceOnly=True)
 
-        # Trailing Stop
         if self.use_trailing:
-             # Activate when price moves 0.8R
              r_dist = abs(market_price - sl_price)
              activation_dist = r_dist * 0.8
              activate_p = market_price + activation_dist if sig['side'] == "Buy" else market_price - activation_dist
-             
-             await self.async_exec.set_trading_stop(
-                 category="linear", symbol=sym, 
-                 trailingStop=self.rnd(r_dist, d), 
-                 activePrice=self.rnd(activate_p, d)
-             )
+             await self.async_exec.set_trading_stop(category="linear", symbol=sym, trailingStop=self.rnd(r_dist, d), activePrice=self.rnd(activate_p, d))
              self.log("   🛡️ Trailing Stop Armed")
 
         try:
@@ -333,7 +298,7 @@ class TradingBot:
             except: time.sleep(5)
 
     async def run(self):
-        self.log(f"🚀 ACTIVE (v8.1 Interpolated Ladder)")
+        self.log(f"🚀 ACTIVE (v8.3 Normalization Fix)")
         await self.async_exec.init_session()
         threading.Thread(target=self.background_streamer, daemon=True).start()
         @self.client.on(events.NewMessage(chats=self.channel_id))
