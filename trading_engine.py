@@ -1,7 +1,7 @@
 import re, asyncio, time, threading, hmac, hashlib, json, sys, random
 import uvloop, aiohttp
 from datetime import datetime
-from telethon import TelegramClient, events, functions
+from telethon import TelegramClient, events, functions, errors
 from pybit.unified_trading import HTTP
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -52,14 +52,9 @@ class AsyncBybit:
             async with self.session.post(url, headers=headers, json=kwargs) as resp: return await resp.json()
         except: return {}
 
-    # --- NEW: Helper to get Position Index (Hedge Mode Support) ---
     async def get_position_idx(self, symbol, side):
         if not self.session: await self.init_session()
-        url = f"{self.base_url}/v5/position/list?category=linear&symbol={symbol}"
         timestamp = str(int(time.time() * 1000))
-        # GET request signature is different, simplified here or use library logic
-        # For speed/simplicity in async, we just rely on defaults or 0 if One-Way.
-        # But to do it right:
         try:
             params = f"category=linear&symbol={symbol}"
             raw = timestamp + self.api_key + "5000" + params
@@ -71,13 +66,11 @@ class AsyncBybit:
             async with self.session.get(f"{self.base_url}/v5/position/list?{params}", headers=headers) as resp:
                 data = await resp.json()
                 if data['retCode'] == 0:
-                    # Check for Hedge Mode
                     for p in data['result']['list']:
-                        # Hedge Mode: Buy=1, Sell=2. One-Way: 0
                         if p['positionIdx'] == 1 and side == "Buy": return 1
                         if p['positionIdx'] == 2 and side == "Sell": return 2
         except: pass
-        return 0 # Default to One-Way
+        return 0
 
 class TradingBot:
     def __init__(self, name, config_dict, custom_parser=None):
@@ -154,7 +147,7 @@ class TradingBot:
     async def execute_trade(self, sig):
         sym = sig['sym']
         now = time.time()
-        # --- FIX 3: RESTORE 10s COOLDOWN (Was 60s) ---
+        
         if sym in self.last_trade_time and (now - self.last_trade_time[sym] < 10): 
             self.log(f"⏳ Skipped Duplicate: {sym}"); return
         self.last_trade_time[sym] = now
@@ -277,21 +270,13 @@ class TradingBot:
         else:
             await self.async_exec.place_order(category="linear", symbol=sym, side=tp_side, orderType="Limit", qty=self.qty_str(final_filled_qty, d), price=self.rnd(sig['tp'], d), reduceOnly=True)
 
-        # --- FIX 2: TRAILING STOP SAFETY & HEDGE MODE ---
         if self.use_trailing:
              r_dist = abs(market_price - sl_price)
              tick_size = d['t']
-             
-             # Safety Check: Must be > 2 ticks
              if r_dist > (tick_size * 2):
                  activation_dist = r_dist * 0.8
                  activate_p = market_price + activation_dist if sig['side'] == "Buy" else market_price - activation_dist
-                 
-                 # Helper to get Position Index (1=Buy, 2=Sell for Hedge; 0 for One-Way)
-                 # Note: In a high-speed engine, doing a REST call here slows us down.
-                 # But it's safer. We rely on the async helper.
                  pidx = await self.async_exec.get_position_idx(sym, sig['side'])
-                 
                  await self.async_exec.set_trading_stop(
                      category="linear", symbol=sym, 
                      trailingStop=self.rnd(r_dist, d), 
@@ -326,19 +311,47 @@ class TradingBot:
                 time.sleep(5)
             except: time.sleep(5)
 
+    # --- NEW: Heartbeat Loop (4 Hours) ---
+    async def heartbeat_loop(self):
+        self.log("💓 HEARTBEAT Monitor Started (4h)")
+        while True:
+            try:
+                await asyncio.sleep(14400) # 4 Hours
+                # Optional: Send a dummy ping to telegram to keep session fresh
+                try:
+                    await self.client(functions.PingRequest(ping_id=random.randint(0, 10000)))
+                except: pass
+                self.log(f"💓 HEARTBEAT: Bot is still listening...")
+            except asyncio.CancelledError: break
+            except: await asyncio.sleep(60)
+
     async def run(self):
-        self.log(f"🚀 ACTIVE (v8.4 Hedge-Mode Fix)")
+        self.log(f"🚀 ACTIVE (v8.5 Heartbeat + Verbose)")
         await self.async_exec.init_session()
         threading.Thread(target=self.background_streamer, daemon=True).start()
+        
+        # Start Heartbeat in background
+        asyncio.create_task(self.heartbeat_loop())
+        
         @self.client.on(events.NewMessage(chats=self.channel_id))
         async def handler(event):
             if not event.text: return
             text = event.raw_text.replace('**', '').replace('__', '')
+            
+            # --- NEW: Verbose Logging ---
+            preview = text.replace('\n', ' ')[:50]
+            self.log(f"📩 HEARD: {preview}...")
+            # ----------------------------
+
             if self.custom_parser: sig = self.custom_parser(text)
             else: sig = self.default_parser(text)
+            
             if sig:
                 self.log(f"✅ PARSED: {sig['sym']} {sig['side']}")
                 await self.execute_trade(sig)
+            else:
+                self.log("⚠️ IGNORED: No signal found")
+
         await self.client.start()
         self.log(f"🌍 Listening to Channel {self.channel_id}...")
         await self.client.run_until_disconnected()
