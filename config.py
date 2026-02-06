@@ -16,8 +16,8 @@ MAIN_API_SECRET = os.getenv('MAIN_API_SECRET')
 MAIN_TESTNET = False
 
 # Risk Management
-MAIN_RISK_MODE = "FIXED"       # "FIXED" or "PERCENTAGE"
-MAIN_RISK_FACTOR = 0.01        # 1% risk if PERCENTAGE mode
+MAIN_RISK_MODE = "PERCENTAGE"       # "FIXED" or "PERCENTAGE"
+MAIN_RISK_FACTOR = 0.10        # 1% risk if PERCENTAGE mode
 MAIN_RISK_PER_TRADE = 450.0    # Fixed Risk in USDT (Fallback)
 MAIN_MAX_POS = 75000.0         # Max position size in USDT
 
@@ -27,7 +27,7 @@ MAIN_MAX_POS = 75000.0         # Max position size in USDT
 # weight = How much of the total size to put at this step
 MAIN_ENTRY_LADDER = [
     {'pos': 0.0, 'weight': 2.0},  # 50% Size (Aggressive Market Entry)
-    {'pos': 0.5, 'weight': 1.0},  # 25% Size (Halfway to Entry)
+    {'pos': 0.9, 'weight': 1.0},  # 25% Size (Halfway to Entry)
     {'pos': 1.0, 'weight': 1.0}   # 25% Size (At Signal Entry)
 ]
 
@@ -44,7 +44,7 @@ CASH_API_SECRET = os.getenv('CASH_API_SECRET')
 CASH_TESTNET = False
 
 CASH_RISK_MODE = "PERCENTAGE"
-CASH_RISK_FACTOR = 0.015       # 1.5% Risk
+CASH_RISK_FACTOR = 0.05       # 5% Risk
 CASH_RISK_AMOUNT = 450.0       # Fallback
 CASH_MAX_POS = 75000.0
 
@@ -60,7 +60,7 @@ KELVIN_API_SECRET = os.getenv('KELVIN_API_SECRET')
 KELVIN_TESTNET = False
 
 KELVIN_RISK_MODE = "PERCENTAGE"
-KELVIN_RISK_FACTOR = 0.015     # 1.5% Risk
+KELVIN_RISK_FACTOR = 0.05     # 5% Risk
 KELVIN_RISK_AMOUNT = 450.0
 KELVIN_MAX_POS = 75000.0
 
