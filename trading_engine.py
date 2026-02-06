@@ -52,6 +52,33 @@ class AsyncBybit:
             async with self.session.post(url, headers=headers, json=kwargs) as resp: return await resp.json()
         except: return {}
 
+    # --- NEW: Helper to get Position Index (Hedge Mode Support) ---
+    async def get_position_idx(self, symbol, side):
+        if not self.session: await self.init_session()
+        url = f"{self.base_url}/v5/position/list?category=linear&symbol={symbol}"
+        timestamp = str(int(time.time() * 1000))
+        # GET request signature is different, simplified here or use library logic
+        # For speed/simplicity in async, we just rely on defaults or 0 if One-Way.
+        # But to do it right:
+        try:
+            params = f"category=linear&symbol={symbol}"
+            raw = timestamp + self.api_key + "5000" + params
+            sig = hmac.new(self.api_secret.encode('utf-8'), raw.encode('utf-8'), hashlib.sha256).hexdigest()
+            headers = {
+                "X-BAPI-API-KEY": self.api_key, "X-BAPI-SIGN": sig,
+                "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": "5000"
+            }
+            async with self.session.get(f"{self.base_url}/v5/position/list?{params}", headers=headers) as resp:
+                data = await resp.json()
+                if data['retCode'] == 0:
+                    # Check for Hedge Mode
+                    for p in data['result']['list']:
+                        # Hedge Mode: Buy=1, Sell=2. One-Way: 0
+                        if p['positionIdx'] == 1 and side == "Buy": return 1
+                        if p['positionIdx'] == 2 and side == "Sell": return 2
+        except: pass
+        return 0 # Default to One-Way
+
 class TradingBot:
     def __init__(self, name, config_dict, custom_parser=None):
         self.name = name
@@ -119,29 +146,22 @@ class TradingBot:
 
     def normalize_price(self, price, market_price):
         if not price or price <= 0: return price
-        # If price is 157 and market is 0.15, convert to 0.157
-        # Safety: Don't normalize if market price is unknown (0)
         if market_price == 0: return price
-        
-        # Shift decimal left if too high
-        while price > (market_price * 2): 
-            price /= 10.0
-        # Shift decimal right if too low
-        while price < (market_price / 10): 
-            price *= 10.0
+        while price > (market_price * 2): price /= 10.0
+        while price < (market_price / 10): price *= 10.0
         return price
 
     async def execute_trade(self, sig):
         sym = sig['sym']
         now = time.time()
-        if sym in self.last_trade_time and (now - self.last_trade_time[sym] < 60): 
+        # --- FIX 3: RESTORE 10s COOLDOWN (Was 60s) ---
+        if sym in self.last_trade_time and (now - self.last_trade_time[sym] < 10): 
             self.log(f"⏳ Skipped Duplicate: {sym}"); return
         self.last_trade_time[sym] = now
 
         d = self.get_instrument(sym)
         if not d: self.log(f"❌ Instrument {sym} not found."); return
 
-        # 1. GET PRICE
         market_price = 0
         with self.data_lock: market_price = self.price_cache.get(sym, 0)
         if market_price == 0:
@@ -151,7 +171,6 @@ class TradingBot:
             except: pass
         if market_price == 0: self.log(f"❌ No price for {sym}"); return
 
-        # --- 1.5 DECIMAL NORMALIZATION (THE FIX) ---
         if sig['sl']: sig['sl'] = self.normalize_price(sig['sl'], market_price)
         if sig['tp']: sig['tp'] = self.normalize_price(sig['tp'], market_price)
         
@@ -166,9 +185,7 @@ class TradingBot:
         
         if 'tps' in sig and sig['tps']:
             sig['tps'] = [self.normalize_price(p, market_price) for p in sig['tps']]
-        # -------------------------------------------
 
-        # 2. RISK CALCULATION
         risk_dollars = self.risk_fixed
         if self.risk_mode == "PERCENTAGE":
             with self.data_lock:
@@ -177,7 +194,6 @@ class TradingBot:
                     self.log(f"📊 Dynamic Risk: ${risk_dollars:.2f}")
                 else: self.log(f"⚠️ Balance 0. Using Fixed: ${risk_dollars}")
 
-        # 3. INTERPOLATED LADDER LOGIC
         signal_entry = sig['entry']
         sl_price = sig['sl']
         
@@ -185,13 +201,11 @@ class TradingBot:
         steps_to_execute = []
         
         if 'entries' in sig and len(sig['entries']) > 0:
-            # Explicit Range
             for i, price in enumerate(sig['entries']):
                  dist = abs(price - sl_price)
                  total_risk_factor += (dist * 1.0)
                  steps_to_execute.append({'price': price, 'weight': 1.0, 'pos': 0})
         else:
-            # Config Ladder
             for step in self.ladder:
                 step_price = market_price + (signal_entry - market_price) * step['pos']
                 dist = abs(step_price - sl_price)
@@ -203,7 +217,6 @@ class TradingBot:
         base_unit_qty = risk_dollars / total_risk_factor
         self.log(f"🚀 {sig['side']} {sym} | Risk: ${risk_dollars:.2f} | Ladder: CMP->{signal_entry}")
 
-        # 4. EXECUTE
         final_filled_qty = 0
         
         for i, step in enumerate(steps_to_execute):
@@ -235,7 +248,6 @@ class TradingBot:
                 self.log(f"   ❌ Step {i+1} Failed: {resp.get('retMsg')}")
             await asyncio.sleep(0.05)
 
-        # 5. EXITS
         tp_side = "Sell" if sig['side'] == "Buy" else "Buy"
 
         if 'tps' in sig and len(sig['tps']) > 0:
@@ -253,7 +265,6 @@ class TradingBot:
             avg_entry = market_price
             risk_dist = abs(avg_entry - sl_price)
             tp1_price = avg_entry + (risk_dist * self.tp_target) if sig['side'] == "Buy" else avg_entry - (risk_dist * self.tp_target)
-            
             tp1_qty = (final_filled_qty * self.partial_tp // d['q']) * d['q']
             tp2_qty = final_filled_qty - tp1_qty
             
@@ -266,12 +277,30 @@ class TradingBot:
         else:
             await self.async_exec.place_order(category="linear", symbol=sym, side=tp_side, orderType="Limit", qty=self.qty_str(final_filled_qty, d), price=self.rnd(sig['tp'], d), reduceOnly=True)
 
+        # --- FIX 2: TRAILING STOP SAFETY & HEDGE MODE ---
         if self.use_trailing:
              r_dist = abs(market_price - sl_price)
-             activation_dist = r_dist * 0.8
-             activate_p = market_price + activation_dist if sig['side'] == "Buy" else market_price - activation_dist
-             await self.async_exec.set_trading_stop(category="linear", symbol=sym, trailingStop=self.rnd(r_dist, d), activePrice=self.rnd(activate_p, d))
-             self.log("   🛡️ Trailing Stop Armed")
+             tick_size = d['t']
+             
+             # Safety Check: Must be > 2 ticks
+             if r_dist > (tick_size * 2):
+                 activation_dist = r_dist * 0.8
+                 activate_p = market_price + activation_dist if sig['side'] == "Buy" else market_price - activation_dist
+                 
+                 # Helper to get Position Index (1=Buy, 2=Sell for Hedge; 0 for One-Way)
+                 # Note: In a high-speed engine, doing a REST call here slows us down.
+                 # But it's safer. We rely on the async helper.
+                 pidx = await self.async_exec.get_position_idx(sym, sig['side'])
+                 
+                 await self.async_exec.set_trading_stop(
+                     category="linear", symbol=sym, 
+                     trailingStop=self.rnd(r_dist, d), 
+                     activePrice=self.rnd(activate_p, d),
+                     positionIdx=pidx
+                 )
+                 self.log(f"   🛡️ Trailing Stop Armed (Idx {pidx})")
+             else:
+                 self.log(f"   ⚠️ TS Skipped: Too close ({r_dist:.4f} < {tick_size*2:.4f})")
 
         try:
             with open("trades_log.csv", "a") as f: f.write(f"{time.time()},{sym},{self.name}\n")
@@ -298,7 +327,7 @@ class TradingBot:
             except: time.sleep(5)
 
     async def run(self):
-        self.log(f"🚀 ACTIVE (v8.3 Normalization Fix)")
+        self.log(f"🚀 ACTIVE (v8.4 Hedge-Mode Fix)")
         await self.async_exec.init_session()
         threading.Thread(target=self.background_streamer, daemon=True).start()
         @self.client.on(events.NewMessage(chats=self.channel_id))
