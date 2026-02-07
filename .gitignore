@@ -1,17 +1,26 @@
-
-*.session
-*.log
+# Python
 __pycache__/
-nohup.out
-backup_v1/
-.bash_history
-.bashrc
-.gitconfig
-.profile
-.ssh/
-*.session
-*.session-journal
+*.py[cod]
+.local/
+.cache/
+.config/
+.bash_logout
+.selected_editor
+
+# Environment & Secrets
 .env
-service_account.json
-.git-credentials
-.git-credentials
+.venv
+env/
+venv/
+
+# Runtime Data
+*.csv
+*.log
+*.pulse
+*.json
+!config.py
+# (Note: keeping config.py for now, but usually .env is safer)
+
+# Backups
+*.bak
+*.swp

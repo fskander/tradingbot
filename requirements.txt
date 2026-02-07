@@ -1,0 +1,5 @@
+telethon
+pybit
+aiohttp
+uvloop
+python-dotenv
