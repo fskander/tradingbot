@@ -48,7 +48,7 @@ CASH_RISK_FACTOR = 0.05       # 5% Risk
 CASH_RISK_AMOUNT = 450.0       # Fallback
 CASH_MAX_POS = 75000.0
 
-CASH_ENTRY_LADDER = [{'pos': 0.0, 'weight': 1.0}] # Single Entry
+CASH_ENTRY_LADDER = [{'pos': 1.0, 'weight': 1.0}] # Single Entry
 CASH_PARTIAL_PCT = 0.30        # 30% per TP target
 
 # ============================================================================
